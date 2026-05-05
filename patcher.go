@@ -48,9 +48,33 @@ type DiscordInstall struct {
 	isOpenAsar       *bool
 }
 
+// resolvedVencordAsarPath returns the vencord.asar path for Discord installs under
+// .../<config>/discord/app-<version>/ so the stub's require() matches XDG layout (including
+// Flatpak ~/.var/.../config) instead of relying on appdir+HOME during sudo.
+func resolvedVencordAsarPath(di *DiscordInstall) string {
+	if os.Getenv("VENCORD_DIRECTORY") != "" || os.Getenv("VENCORD_USER_DATA_DIR") != "" || os.Getenv("DISCORD_USER_DATA_DIR") != "" {
+		return ""
+	}
+	if !strings.HasPrefix(path.Base(di.path), "app-") {
+		return ""
+	}
+	xdgConfig := path.Dir(path.Dir(di.path))
+	return path.Join(xdgConfig, "Vencord", "vencord.asar")
+}
+
+func patchResourcesOwnership(di *DiscordInstall) {
+	if os.Geteuid() == 0 {
+		if di.isSystemElectron {
+			_ = FixOwnership(di.path)
+		} else {
+			_ = FixOwnership(path.Join(di.appPath, ".."))
+		}
+	}
+}
+
 //region Patch
 
-func patchAppAsar(dir string, isSystemElectron bool) (err error) {
+func patchAppAsar(dir string) (err error) {
 	appAsar := path.Join(dir, "app.asar")
 	_appAsar := path.Join(dir, "_app.asar")
 
@@ -76,14 +100,14 @@ func patchAppAsar(dir string, isSystemElectron bool) (err error) {
 	}
 	renamesDone = append(renamesDone, []string{appAsar, _appAsar})
 
-	if isSystemElectron {
-		from, to := appAsar+".unpacked", _appAsar+".unpacked"
-		Log.Debug("Renaming", from, "to", to)
-		err := os.Rename(from, to)
+	unpackedFrom, unpackedTo := appAsar+".unpacked", _appAsar+".unpacked"
+	if ExistsFile(unpackedFrom) {
+		Log.Debug("Renaming", unpackedFrom, "to", unpackedTo)
+		err := os.Rename(unpackedFrom, unpackedTo)
 		if err != nil {
 			return err
 		}
-		renamesDone = append(renamesDone, []string{from, to})
+		renamesDone = append(renamesDone, []string{unpackedFrom, unpackedTo})
 	}
 
 	Log.Debug("Writing custom app.asar to", appAsar)
@@ -96,6 +120,13 @@ func patchAppAsar(dir string, isSystemElectron bool) (err error) {
 
 func (di *DiscordInstall) patch() error {
 	Log.Info("Patching " + di.path + "...")
+	origVencordDir := VencordDirectory
+	if v := resolvedVencordAsarPath(di); v != "" {
+		Log.Debug("Vencord asar path for this install:", v)
+		VencordDirectory = v
+		defer func() { VencordDirectory = origVencordDir }()
+	}
+
 	if LatestHash != InstalledHash {
 		if err := InstallLatestBuilds(); err != nil {
 			return nil // already shown dialog so don't return same error again
@@ -115,14 +146,16 @@ func (di *DiscordInstall) patch() error {
 	}
 
 	if di.isSystemElectron {
-		if err := patchAppAsar(di.path, true); err != nil {
+		if err := patchAppAsar(di.path); err != nil {
 			return err
 		}
 	} else {
-		if err := patchAppAsar(path.Join(di.appPath, ".."), false); err != nil {
+		if err := patchAppAsar(path.Join(di.appPath, "..")); err != nil {
 			return err
 		}
 	}
+
+	patchResourcesOwnership(di)
 
 	Log.Info("Successfully patched", di.path)
 	di.isPatched = true
@@ -175,7 +208,7 @@ func (di *DiscordInstall) patch() error {
 
 // region Unpatch
 
-func unpatchAppAsar(dir string, isSystemElectron bool) (errOut error) {
+func unpatchAppAsar(dir string) (errOut error) {
 	appAsar := path.Join(dir, "app.asar")
 	appAsarTmp := path.Join(dir, "app.asar.tmp")
 	_appAsar := path.Join(dir, "_app.asar")
@@ -198,6 +231,24 @@ func unpatchAppAsar(dir string, isSystemElectron bool) (errOut error) {
 		}
 	}()
 
+	// Broken state: _app.asar left from a patch but app.asar missing (updater or manual delete).
+	if !ExistsFile(appAsar) && ExistsFile(_appAsar) {
+		Log.Info("Repairing inconsistent patch state (restoring app.asar from _app.asar)")
+		if err := os.Rename(_appAsar, appAsar); err != nil {
+			err = CheckIfErrIsCauseItsBusyRn(err)
+			Log.Error(err.Error())
+			return err
+		}
+		from, to := _appAsar+".unpacked", appAsar+".unpacked"
+		if ExistsFile(from) {
+			if err := os.Rename(from, to); err != nil {
+				Log.Error(err.Error())
+				return err
+			}
+		}
+		return nil
+	}
+
 	Log.Debug("Deleting", appAsar)
 	if err := os.Rename(appAsar, appAsarTmp); err != nil {
 		err = CheckIfErrIsCauseItsBusyRn(err)
@@ -216,7 +267,7 @@ func unpatchAppAsar(dir string, isSystemElectron bool) (errOut error) {
 		renamesDone = append(renamesDone, []string{_appAsar, appAsar})
 	}
 
-	if isSystemElectron {
+	if ExistsFile(_appAsar + ".unpacked") {
 		Log.Debug("Renaming", _appAsar+".unpacked", "to", appAsar+".unpacked")
 		if err := os.Rename(_appAsar+".unpacked", appAsar+".unpacked"); err != nil {
 			Log.Error(err.Error())
@@ -232,14 +283,16 @@ func (di *DiscordInstall) unpatch() error {
 	PreparePatch(di)
 
 	if di.isSystemElectron {
-		if err := unpatchAppAsar(di.path, true); err != nil {
+		if err := unpatchAppAsar(di.path); err != nil {
 			return err
 		}
 	} else {
-		if err := unpatchAppAsar(path.Join(di.appPath, ".."), false); err != nil {
+		if err := unpatchAppAsar(path.Join(di.appPath, "..")); err != nil {
 			return err
 		}
 	}
+
+	patchResourcesOwnership(di)
 
 	Log.Info("Successfully unpatched", di.path)
 	di.isPatched = false

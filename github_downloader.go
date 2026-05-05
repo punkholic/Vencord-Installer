@@ -177,6 +177,11 @@ func installLatestBuilds() (retErr error) {
 		retErr = err
 		return
 	}
+	if err := os.MkdirAll(path.Dir(VencordDirectory), 0755); err != nil {
+		Log.Error("Failed to create directory for", VencordDirectory+":", err)
+		retErr = err
+		return
+	}
 	out, err := os.OpenFile(VencordDirectory, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		Log.Error("Failed to create", VencordDirectory+":", err)

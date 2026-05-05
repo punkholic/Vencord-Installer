@@ -1,4 +1,5 @@
 vencordinstaller
+vencord-installer-cli
 *.exe
 *.syso
 *.old

@@ -84,6 +84,10 @@ func FindDiscords() []any {
 			discords = append(discords, discord)
 		}
 	}
+
+	// Microsoft Store / non-standard layouts under %LOCALAPPDATA%
+	discords = mergeDiscordInstallsUnique(discords, discoverDiscordInstallsFromAppAsarScan())
+
 	return discords
 }
 

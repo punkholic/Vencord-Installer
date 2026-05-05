@@ -81,7 +81,14 @@ func ParseDiscord(p, _ string) *DiscordInstall {
 	isPatched, isSystemElectron := false, false
 
 	if ExistsFile(resources) { // normal install
-		isPatched = ExistsFile(path.Join(resources, "_app.asar"))
+		appAsar := path.Join(resources, "app.asar")
+		legacyAsar := path.Join(resources, "_app.asar")
+		if !ExistsFile(appAsar) && !ExistsFile(legacyAsar) {
+			// e.g. empty resources/ under /usr/share/discord bootstrap-only packages
+			Log.Warn("Tried to parse invalid Location (no app.asar in resources):", p)
+			return nil
+		}
+		isPatched = ExistsFile(legacyAsar)
 	} else if ExistsFile(path.Join(p, "app.asar")) { // System electron doesn't have resources folder
 		isSystemElectron = true
 		isPatched = ExistsFile(path.Join(p, "_app.asar.unpacked"))
@@ -125,7 +132,54 @@ func FindDiscords() []any {
 		}
 	}
 
+	// User-data app-* dirs (bootstrap .deb, etc.): always merge so they appear alongside /opt etc.
+	discords = append(discords, findUserConfigDiscordApps()...)
+
+	// Extra: any resources/{app,_app}.asar under ~/.config/discord*, /opt, ~/.local/share/*discord*
+	discords = mergeDiscordInstallsUnique(discords, discoverDiscordInstallsFromAppAsarScan())
+
 	return discords
+}
+
+// findUserConfigDiscordApps discovers app-* folders under Discord's config directory.
+func findUserConfigDiscordApps() []any {
+	configHome := os.Getenv("XDG_CONFIG_HOME")
+	if configHome == "" {
+		configHome = path.Join(Home, ".config")
+	}
+	var out []any
+	for _, root := range []string{
+		path.Join(configHome, "discord"),
+		path.Join(configHome, "discordcanary"),
+		path.Join(configHome, "DiscordCanary"),
+		path.Join(configHome, "discordptb"),
+		path.Join(configHome, "DiscordPTB"),
+		path.Join(configHome, "discorddevelopment"),
+		path.Join(configHome, "DiscordDevelopment"),
+	} {
+		children, err := os.ReadDir(root)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				Log.Warn("Error during readdir "+root+":", err)
+			}
+			continue
+		}
+		for _, child := range children {
+			if !child.IsDir() {
+				continue
+			}
+			name := child.Name()
+			if !strings.HasPrefix(name, "app-") {
+				continue
+			}
+			discordDir := path.Join(root, name)
+			if discord := ParseDiscord(discordDir, ""); discord != nil {
+				Log.Debug("Found Discord user-data install at ", discordDir)
+				out = append(out, discord)
+			}
+		}
+	}
+	return out
 }
 
 func PreparePatch(di *DiscordInstall) {}
